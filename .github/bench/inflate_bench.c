@@ -3,13 +3,19 @@
  *
  * Only the inflate loop is timed; init and end are outside the clock.  The
  * default clock is per-process CPU time, which is far less sensitive to other
- * tenants on a shared CI runner than wall time.
+ * tenants on a shared CI runner than wall time.  On Windows, clock_gettime is
+ * either missing at link time (clangarm64) or ~15.6 ms, so QueryPerformanceCounter
+ * is used instead.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#endif
 #include "zlib.h"
 
 #define WINSIZE 32768
@@ -22,6 +28,16 @@
 static int use_cpu_clock = 1;
 
 static double now(void) {
+#if defined(_WIN32)
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER counter;
+
+    (void)use_cpu_clock;
+    if (freq.QuadPart == 0)
+        QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart / (double)freq.QuadPart;
+#else
     struct timespec ts;
 
 #ifdef HAVE_CPU_CLOCK
@@ -32,6 +48,7 @@ static double now(void) {
 #endif
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec * 1e-9;
+#endif
 }
 
 static int cmp_double(const void *a, const void *b) {
@@ -282,6 +299,10 @@ int main(int argc, char **argv) {
     med = times[iters / 2];
     p10 = times[(iters - 1) * 10 / 100];
     p90 = times[(iters - 1) * 90 / 100];
+    if (med <= 0.0) {
+        fprintf(stderr, "clock resolution too coarse (median=%.9f)\n", med);
+        return 1;
+    }
     printf("mode=%s chunk=%u median=%.9f p10=%.9f p90=%.9f best=%.9f "
            "mbs=%.2f iters=%d clock=%s\n",
            mode, strcmp(mode, "chunk") == 0 ? chunk : 0u, med, p10, p90, best,
