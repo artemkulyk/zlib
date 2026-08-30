@@ -50,39 +50,13 @@
     - memcpy from the sliding window is skipped when the window is also the
       output buffer (inflateBack(), window == beg), because memcpy of
       overlapping regions is undefined.
+
+    - A match of 16 bytes or more from output uses memset when dist is 1, and
+      memcpy when dist > len (the source lies fully behind this match).
+      Overlapping and adjacent matches keep the three-byte unroll. A single
+      match is at most 258 bytes, so libc memcpy is not used as a portable
+      speedup for those lengths.
  */
-
-/*
-   Copy len bytes to out from out - dist, repeating a dist-byte pattern.
-   Each memcpy is non-overlapping (length at most the bytes already written).
-   Only called for len >= 16 and dist >= 2.
- */
-local unsigned char FAR *ocopy(unsigned char FAR *out, unsigned dist,
-                               unsigned len) {
-    unsigned n, k;
-
-    Assert(dist >= 2 && len >= 16, "ocopy");
-    n = len >= dist ? dist : len;
-    zmemcpy(out, out - dist, n);
-    out += n;
-    len -= n;
-    while (len) {
-        k = len >= n ? n : len;
-        zmemcpy(out, out - n, k);
-        out += k;
-        len -= k;
-        n += k;
-    }
-    return out;
-}
-
-/* Copy a run of the byte immediately preceding out.  Only called for
-   len >= 16. */
-local unsigned char FAR *rcopy(unsigned char FAR *out, unsigned len) {
-    Assert(len >= 16, "rcopy");
-    zmemset(out, out[-1], len);
-    return out + len;
-}
 
 void ZLIB_INTERNAL inflate_fast(z_streamp strm, unsigned start) {
     struct inflate_state FAR *state;
@@ -337,11 +311,13 @@ void ZLIB_INTERNAL inflate_fast(z_streamp strm, unsigned start) {
                     if (len) {
                         if (from_out) {         /* copy direct from output */
                             from = out - dist;
-                            if (len >= 16) {
-                                if (dist == 1)
-                                    out = rcopy(out, len);
-                                else
-                                    out = ocopy(out, dist, len);
+                            if (len >= 16 && dist == 1) {
+                                zmemset(out, out[-1], len);
+                                out += len;
+                            }
+                            else if (len >= 16 && dist > len) {
+                                zmemcpy(out, out - dist, len);
+                                out += len;
                             }
                             else {
                                 while (len > 2) {
@@ -380,11 +356,13 @@ void ZLIB_INTERNAL inflate_fast(z_streamp strm, unsigned start) {
                 }
                 else {
                     from = out - dist;          /* copy direct from output */
-                    if (len >= 16) {
-                        if (dist == 1)          /* run of a repeated byte */
-                            out = rcopy(out, len);
-                        else
-                            out = ocopy(out, dist, len);
+                    if (len >= 16 && dist == 1) {   /* run of a repeated byte */
+                        zmemset(out, out[-1], len);
+                        out += len;
+                    }
+                    else if (len >= 16 && dist > len) {
+                        zmemcpy(out, out - dist, len);
+                        out += len;
                     }
                     else {                      /* minimum length is three */
                         do {
@@ -457,8 +435,8 @@ void ZLIB_INTERNAL inflate_fast(z_streamp strm, unsigned start) {
    - Larger unrolled copy loops (three is about right)
    - Moving len -= 3 statement into middle of loop
 
-   The overlapped load/store copy above is not the same as the current
-   non-overlapping chunked memcpy / memset match copies.
+   The overlapped load/store copy above is not the same as memcpy of a
+   match whose source lies fully behind the destination (dist > len).
  */
 
 #endif /* !ASMINF */

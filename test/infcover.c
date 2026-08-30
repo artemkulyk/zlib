@@ -816,8 +816,8 @@ local void split_inflate(unsigned char *src, unsigned *chunk, int nchunk,
     fputc('\n', stderr);
 }
 
-/* Golden output for ocopy, rcopy, mixed window+output, wrap, and short
-   remainder after a window prefix. */
+/* Golden output for dist-1 runs, repeating patterns, mixed window+output,
+   wrap, and short remainder after a window prefix. */
 local void cover_fast_copies(void)
 {
     unsigned n, first, second, dist, extra, i, len;
@@ -832,7 +832,7 @@ local void cover_fast_copies(void)
         for (i = 0; i < 64; i++)
             src[i] = (unsigned char)(i + 1);
         fill_repeat(src + 64, 64 + len, 1);
-        sprintf(what, "inflate_fast rcopy dist 1 len %u", len);
+        sprintf(what, "inflate_fast dist 1 len %u", len);
         roundtrip_raw(src, 64 + 64 + len, 15, Z_RLE, what);
     }
     free(src);
@@ -844,7 +844,7 @@ local void cover_fast_copies(void)
     for (n = 0; n < 3; n++) {
         dist = dists[n];
         fill_repeat(src, 2048, dist);
-        sprintf(what, "inflate_fast ocopy dist %u", dist);
+        sprintf(what, "inflate_fast repeat dist %u", dist);
         roundtrip_raw(src, 2048, 15, Z_DEFAULT_STRATEGY, what);
     }
     free(src);
@@ -1031,9 +1031,10 @@ local void cover_fast_window(void)
 }
 
 /* Hex cases cover inflate_fast() error paths and return codes only (no
-   memcmp).  cover_fast_copies() checks ocopy/rcopy/from_out/wrap/short
-   remainder bytes via inflate and inflateBack.  cover_fast_window() checks
-   non-overlapping window memcpy into a fresh output buffer. */
+   memcmp).  cover_fast_copies() checks dist-1 runs, repeating matches,
+   from_out, wrap, and short remainder bytes via inflate and inflateBack.
+   cover_fast_window() checks non-overlapping window memcpy into a fresh
+   output buffer. */
 local void cover_fast(void)
 {
     inf("e5 e0 81 ad 6d cb b2 2c c9 01 1e 59 63 ae 7d ee fb 4d fd b5 35 41 68"
