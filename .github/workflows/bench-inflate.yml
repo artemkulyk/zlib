@@ -148,8 +148,9 @@ jobs:
           set -- $pair
           mkdir -p "$WORKDIR/$1"
           git archive "$2" | tar -x -C "$WORKDIR/$1"
+          # static builds minigzip$(EXE); a bare minigzip goal misses .exe on Windows
           ( cd "$WORKDIR/$1" && ./configure --static > configure.log 2>&1 &&
-            make -j"$j" libz.a minigzip )
+            make -j"$j" static )
         done
         if cmp -s "$WORKDIR/stock/inffast.o" "$WORKDIR/opt/inffast.o"; then
           echo "::error::inffast.o is identical to the baseline"
@@ -157,7 +158,9 @@ jobs:
         fi
 
     - name: Generate corpora
-      run: python3 .github/bench/make_corpora.py --out "$WORKDIR/corpora"
+      run: |
+        PYTHON=$(command -v python3 || command -v python)
+        "$PYTHON" .github/bench/make_corpora.py --out "$WORKDIR/corpora"
 
     - name: Check both builds decompress identically
       run: |
@@ -184,7 +187,8 @@ jobs:
 
     - name: Run benchmark
       run: |
-        python3 .github/bench/run_bench.py \
+        PYTHON=$(command -v python3 || command -v python)
+        "$PYTHON" .github/bench/run_bench.py \
           --stock "$WORKDIR/bench-stock" \
           --opt "$WORKDIR/bench-opt" \
           --data "$WORKDIR/corpora" \
@@ -202,10 +206,11 @@ jobs:
         path: bench.csv
         retention-days: 14
 
+  # Alpine as a job-level container cannot run JS actions on ARM runners, so
+  # checkout stays on the host and the bench runs inside docker alpine:3.21.
   bench-musl:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    container: alpine:3.21
     strategy:
       fail-fast: false
       matrix:
@@ -217,21 +222,10 @@ jobs:
             name: Linux aarch64 musl
             os: ubuntu-24.04-arm
     steps:
-    - name: Install Alpine packages
-      run: apk add --no-cache gcc make musl-dev git python3 bash tar
-
     - name: Checkout repository
       uses: actions/checkout@v6
       with:
         fetch-depth: 0
-
-    - name: Set work directory
-      run: |
-        set -eu
-        w="${RUNNER_TEMP:-/tmp}/zlib-bench"
-        mkdir -p "$w"
-        echo "WORKDIR=$w" >> "$GITHUB_ENV"
-        echo "using $w"
 
     - name: Resolve baseline
       id: base
@@ -245,62 +239,62 @@ jobs:
         echo "sha=$(git rev-parse "$base")" >> "$GITHUB_OUTPUT"
         git log -1 --oneline "$base"
 
-    - name: Build baseline and current
+    - name: Bench inside Alpine musl
       env:
-        CFLAGS: -O3
-        CC: gcc
+        BASE_SHA: ${{ steps.base.outputs.sha }}
+        LABEL: ${{ matrix.name }}
+        ROUNDS: ${{ inputs.rounds || '3' }}
+        ITERS: ${{ inputs.iters || '25' }}
       run: |
         set -eu
-        j=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc)
-        for pair in "stock ${{ steps.base.outputs.sha }}" "opt HEAD"; do
-          set -- $pair
-          mkdir -p "$WORKDIR/$1"
-          git archive "$2" | tar -x -C "$WORKDIR/$1"
-          ( cd "$WORKDIR/$1" && ./configure --static > configure.log 2>&1 &&
-            make -j"$j" libz.a minigzip )
-        done
-        if cmp -s "$WORKDIR/stock/inffast.o" "$WORKDIR/opt/inffast.o"; then
-          echo "::error::inffast.o is identical to the baseline"
-          exit 1
-        fi
-
-    - name: Generate corpora
-      run: python3 .github/bench/make_corpora.py --out "$WORKDIR/corpora"
-
-    - name: Check both builds decompress identically
-      run: |
-        set -eu
-        for bin in "$WORKDIR"/corpora/*.bin; do
-          name=$(basename "$bin" .bin)
-          for tree in stock opt; do
-            "$WORKDIR/$tree/minigzip" -d -c < "$WORKDIR/corpora/$name.gz" > "$WORKDIR/$tree.out"
-            cmp "$bin" "$WORKDIR/$tree.out"
-          done
-        done
-        echo "all corpora decompress byte-identically on both builds"
-
-    - name: Build benchmark
-      env:
-        CFLAGS: -O3
-      run: |
-        set -eu
-        for tree in stock opt; do
-          gcc $CFLAGS -Wall -Wextra -I "$WORKDIR/$tree" \
-            -o "$WORKDIR/bench-$tree" .github/bench/inflate_bench.c \
-            "$WORKDIR/$tree/libz.a"
-        done
-
-    - name: Run benchmark
-      run: |
-        python3 .github/bench/run_bench.py \
-          --stock "$WORKDIR/bench-stock" \
-          --opt "$WORKDIR/bench-opt" \
-          --data "$WORKDIR/corpora" \
-          --csv bench.csv \
-          --label "${{ matrix.name }}" \
-          --rounds "${{ inputs.rounds || '3' }}" \
-          --iters "${{ inputs.iters || '25' }}" \
-          --clock cpu
+        mkdir -p "$RUNNER_TEMP/zlib-bench"
+        docker run --rm \
+          -v "$GITHUB_WORKSPACE:/src:ro" \
+          -v "$RUNNER_TEMP/zlib-bench:/work" \
+          -w /src \
+          -e BASE_SHA -e LABEL -e ROUNDS -e ITERS \
+          alpine:3.21 \
+          sh -euxc '
+            apk add --no-cache gcc make musl-dev git python3 bash tar
+            git config --global --add safe.directory /src
+            j=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc || echo 2)
+            export CFLAGS=-O3 CC=gcc
+            for pair in "stock $BASE_SHA" "opt HEAD"; do
+              set -- $pair
+              mkdir -p "/work/$1"
+              git archive "$2" | tar -x -C "/work/$1"
+              ( cd "/work/$1" && ./configure --static > configure.log 2>&1 &&
+                make -j"$j" static )
+            done
+            if cmp -s /work/stock/inffast.o /work/opt/inffast.o; then
+              echo "::error::inffast.o is identical to the baseline"
+              exit 1
+            fi
+            python3 /src/.github/bench/make_corpora.py --out /work/corpora
+            for bin in /work/corpora/*.bin; do
+              name=$(basename "$bin" .bin)
+              for tree in stock opt; do
+                "/work/$tree/minigzip" -d -c < "/work/corpora/$name.gz" > "/work/$tree.out"
+                cmp "$bin" "/work/$tree.out"
+              done
+            done
+            echo "all corpora decompress byte-identically on both builds"
+            for tree in stock opt; do
+              gcc $CFLAGS -Wall -Wextra -I "/work/$tree" \
+                -o "/work/bench-$tree" /src/.github/bench/inflate_bench.c \
+                "/work/$tree/libz.a"
+            done
+            python3 /src/.github/bench/run_bench.py \
+              --stock /work/bench-stock \
+              --opt /work/bench-opt \
+              --data /work/corpora \
+              --csv /work/bench.csv \
+              --label "$LABEL" \
+              --rounds "$ROUNDS" \
+              --iters "$ITERS" \
+              --clock cpu
+          '
+        cp "$RUNNER_TEMP/zlib-bench/bench.csv" bench.csv
 
     - name: Upload results
       uses: actions/upload-artifact@v6
