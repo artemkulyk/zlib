@@ -2,7 +2,7 @@ name: Bench inflate
 
 # Builds the current tree and a baseline ref with identical flags, checks that
 # both produce the same bytes, then compares inflate throughput on real
-# hardware for several ISAs.  Reports only; never fails on a speed change.
+# hardware.  Reports only; never fails on a speed change.
 
 on:
   workflow_dispatch:
@@ -22,25 +22,71 @@ jobs:
   bench:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - id: linux-x86-64
-            name: Linux x86-64 glibc
+            name: Linux x86-64 glibc gcc
             os: ubuntu-24.04
+            shell: bash
+            cc: gcc
+            cflags: -O3
+
+          - id: linux-x86-64-clang
+            name: Linux x86-64 glibc clang
+            os: ubuntu-24.04
+            shell: bash
+            cc: clang
             cflags: -O3
 
           - id: linux-aarch64
-            name: Linux aarch64 glibc
+            name: Linux aarch64 glibc gcc
             os: ubuntu-24.04-arm
+            shell: bash
+            cc: gcc
+            cflags: -O3
+
+          - id: linux-aarch64-clang
+            name: Linux aarch64 glibc clang
+            os: ubuntu-24.04-arm
+            shell: bash
+            cc: clang
             cflags: -O3
 
           - id: linux-x86-32
             name: Linux x86 32-bit
             os: ubuntu-24.04
+            shell: bash
+            cc: gcc
             cflags: -O3 -m32
             packages: gcc-multilib
+
+          - id: macos-arm
+            name: macOS ARM Apple clang
+            os: macos-latest
+            shell: bash
+            cc: clang
+            cflags: -O3
+
+          - id: windows-x86-64
+            name: Windows x86-64 MSYS2 ucrt64
+            os: windows-latest
+            shell: msys2 {0}
+            cc: gcc
+            cflags: -O3
+            msystem: ucrt64
+
+          - id: windows-arm64
+            name: Windows ARM64 MSYS2 clangarm64
+            os: windows-11-arm
+            shell: msys2 {0}
+            cc: gcc
+            cflags: -O3
+            msystem: clangarm64
 
     steps:
     - name: Checkout repository
@@ -48,15 +94,41 @@ jobs:
       with:
         fetch-depth: 0
 
+    - name: Setup MSYS2
+      if: matrix.msystem
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: ${{ matrix.msystem }}
+        update: true
+        install: >-
+          make
+          git
+          python
+        pacboy: >-
+          toolchain:p
+
     - name: Install packages
       if: matrix.packages
       run: |
         sudo apt-get update
         sudo apt-get install -y ${{ matrix.packages }}
 
+    - name: Set work directory
+      run: |
+        set -eu
+        if command -v cygpath >/dev/null 2>&1; then
+          w="$(cygpath -u "${RUNNER_TEMP}")/zlib-bench"
+        else
+          w="${RUNNER_TEMP}/zlib-bench"
+        fi
+        mkdir -p "$w"
+        echo "WORKDIR=$w" >> "$GITHUB_ENV"
+        echo "using $w"
+
     - name: Resolve baseline
       id: base
       run: |
+        set -eu
         if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
           base='${{ github.event.pull_request.base.sha }}'
         else
@@ -68,32 +140,33 @@ jobs:
     - name: Build baseline and current
       env:
         CFLAGS: ${{ matrix.cflags }}
+        CC: ${{ matrix.cc }}
       run: |
         set -eu
+        j=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc)
         for pair in "stock ${{ steps.base.outputs.sha }}" "opt HEAD"; do
           set -- $pair
-          mkdir -p "/tmp/$1"
-          git archive "$2" | tar -x -C "/tmp/$1"
-          ( cd "/tmp/$1" && ./configure --static > configure.log 2>&1 &&
-            make -j"$(nproc)" libz.a minigzip )
+          mkdir -p "$WORKDIR/$1"
+          git archive "$2" | tar -x -C "$WORKDIR/$1"
+          ( cd "$WORKDIR/$1" && ./configure --static > configure.log 2>&1 &&
+            make -j"$j" libz.a minigzip )
         done
-        # If the object is unchanged there is nothing to measure.
-        if cmp -s /tmp/stock/inffast.o /tmp/opt/inffast.o; then
+        if cmp -s "$WORKDIR/stock/inffast.o" "$WORKDIR/opt/inffast.o"; then
           echo "::error::inffast.o is identical to the baseline"
           exit 1
         fi
 
     - name: Generate corpora
-      run: python3 .github/bench/make_corpora.py --out /tmp/corpora
+      run: python3 .github/bench/make_corpora.py --out "$WORKDIR/corpora"
 
     - name: Check both builds decompress identically
       run: |
         set -eu
-        for bin in /tmp/corpora/*.bin; do
+        for bin in "$WORKDIR"/corpora/*.bin; do
           name=$(basename "$bin" .bin)
           for tree in stock opt; do
-            "/tmp/$tree/minigzip" -d -c < "/tmp/corpora/$name.gz" > "/tmp/$tree.out"
-            cmp "$bin" "/tmp/$tree.out"
+            "$WORKDIR/$tree/minigzip" -d -c < "$WORKDIR/corpora/$name.gz" > "$WORKDIR/$tree.out"
+            cmp "$bin" "$WORKDIR/$tree.out"
           done
         done
         echo "all corpora decompress byte-identically on both builds"
@@ -104,18 +177,18 @@ jobs:
       run: |
         set -eu
         for tree in stock opt; do
-          cc $CFLAGS -Wall -Wextra -I "/tmp/$tree" \
-            -o "/tmp/bench-$tree" .github/bench/inflate_bench.c \
-            "/tmp/$tree/libz.a"
+          ${{ matrix.cc }} $CFLAGS -Wall -Wextra -I "$WORKDIR/$tree" \
+            -o "$WORKDIR/bench-$tree" .github/bench/inflate_bench.c \
+            "$WORKDIR/$tree/libz.a"
         done
 
     - name: Run benchmark
       run: |
         python3 .github/bench/run_bench.py \
-          --stock /tmp/bench-stock \
-          --opt /tmp/bench-opt \
-          --data /tmp/corpora \
-          --csv /tmp/bench.csv \
+          --stock "$WORKDIR/bench-stock" \
+          --opt "$WORKDIR/bench-opt" \
+          --data "$WORKDIR/corpora" \
+          --csv bench.csv \
           --label "${{ matrix.name }}" \
           --rounds "${{ inputs.rounds || '3' }}" \
           --iters "${{ inputs.iters || '25' }}" \
@@ -126,5 +199,113 @@ jobs:
       if: always()
       with:
         name: bench-${{ matrix.id }}
-        path: /tmp/bench.csv
+        path: bench.csv
+        retention-days: 14
+
+  bench-musl:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    container: alpine:3.21
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: linux-x86-64-musl
+            name: Linux x86-64 musl
+            os: ubuntu-24.04
+          - id: linux-aarch64-musl
+            name: Linux aarch64 musl
+            os: ubuntu-24.04-arm
+    steps:
+    - name: Install Alpine packages
+      run: apk add --no-cache gcc make musl-dev git python3 bash tar
+
+    - name: Checkout repository
+      uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+
+    - name: Set work directory
+      run: |
+        set -eu
+        w="${RUNNER_TEMP:-/tmp}/zlib-bench"
+        mkdir -p "$w"
+        echo "WORKDIR=$w" >> "$GITHUB_ENV"
+        echo "using $w"
+
+    - name: Resolve baseline
+      id: base
+      run: |
+        set -eu
+        if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+          base='${{ github.event.pull_request.base.sha }}'
+        else
+          base='${{ inputs.base_ref }}'
+        fi
+        echo "sha=$(git rev-parse "$base")" >> "$GITHUB_OUTPUT"
+        git log -1 --oneline "$base"
+
+    - name: Build baseline and current
+      env:
+        CFLAGS: -O3
+        CC: gcc
+      run: |
+        set -eu
+        j=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc)
+        for pair in "stock ${{ steps.base.outputs.sha }}" "opt HEAD"; do
+          set -- $pair
+          mkdir -p "$WORKDIR/$1"
+          git archive "$2" | tar -x -C "$WORKDIR/$1"
+          ( cd "$WORKDIR/$1" && ./configure --static > configure.log 2>&1 &&
+            make -j"$j" libz.a minigzip )
+        done
+        if cmp -s "$WORKDIR/stock/inffast.o" "$WORKDIR/opt/inffast.o"; then
+          echo "::error::inffast.o is identical to the baseline"
+          exit 1
+        fi
+
+    - name: Generate corpora
+      run: python3 .github/bench/make_corpora.py --out "$WORKDIR/corpora"
+
+    - name: Check both builds decompress identically
+      run: |
+        set -eu
+        for bin in "$WORKDIR"/corpora/*.bin; do
+          name=$(basename "$bin" .bin)
+          for tree in stock opt; do
+            "$WORKDIR/$tree/minigzip" -d -c < "$WORKDIR/corpora/$name.gz" > "$WORKDIR/$tree.out"
+            cmp "$bin" "$WORKDIR/$tree.out"
+          done
+        done
+        echo "all corpora decompress byte-identically on both builds"
+
+    - name: Build benchmark
+      env:
+        CFLAGS: -O3
+      run: |
+        set -eu
+        for tree in stock opt; do
+          gcc $CFLAGS -Wall -Wextra -I "$WORKDIR/$tree" \
+            -o "$WORKDIR/bench-$tree" .github/bench/inflate_bench.c \
+            "$WORKDIR/$tree/libz.a"
+        done
+
+    - name: Run benchmark
+      run: |
+        python3 .github/bench/run_bench.py \
+          --stock "$WORKDIR/bench-stock" \
+          --opt "$WORKDIR/bench-opt" \
+          --data "$WORKDIR/corpora" \
+          --csv bench.csv \
+          --label "${{ matrix.name }}" \
+          --rounds "${{ inputs.rounds || '3' }}" \
+          --iters "${{ inputs.iters || '25' }}" \
+          --clock cpu
+
+    - name: Upload results
+      uses: actions/upload-artifact@v6
+      if: always()
+      with:
+        name: bench-${{ matrix.id }}
+        path: bench.csv
         retention-days: 14
