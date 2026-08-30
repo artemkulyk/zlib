@@ -1,5 +1,5 @@
 /* infcover.c -- test zlib's inflate routines with full code coverage
- * Copyright (C) 2011, 2016, 2024 Mark Adler
+ * Copyright (C) 2011, 2016, 2024, 2026 Mark Adler
  * For conditions of distribution and use, see copyright notice in zlib.h
  */
 
@@ -638,7 +638,402 @@ local void cover_trees(void)
     fputs("inflate_table not enough errors\n", stderr);
 }
 
-/* cover remaining inffast.c decoding and window copying */
+/* inflateBack() in/out for golden-output tests: all input is already in
+   next_in, and output is captured for memcmp. */
+local unsigned pull_none(void *desc, unsigned char z_const **buf)
+{
+    (void)desc;
+    (void)buf;
+    return 0;
+}
+
+struct back_buf {
+    unsigned char *out;
+    unsigned got;
+    unsigned cap;
+};
+
+local int push_copy(void *desc, unsigned char *buf, unsigned len)
+{
+    struct back_buf *d = desc;
+
+    assert(d->got + len <= d->cap);
+    memcpy(d->out + d->got, buf, len);
+    d->got += len;
+    return 0;
+}
+
+/* Fill dst[0..n) with a repeating dist-byte pattern. */
+local void fill_repeat(unsigned char *dst, unsigned n, unsigned dist)
+{
+    unsigned i;
+
+    assert(dist > 0);
+    for (i = 0; i < dist && i < n; i++)
+        dst[i] = (unsigned char)(i * 17 + 3);
+    for (; i < n; i++)
+        dst[i] = dst[i - dist];
+}
+
+/* Raw deflate then inflate and inflateBack, comparing bytes.  avail_out is
+   large enough that inflate_fast() runs. */
+local void roundtrip_raw(unsigned char *src, unsigned len, int windowBits,
+                         int strategy, char *what)
+{
+    int ret;
+    unsigned have, bound, wsize;
+    unsigned char *comp, *out, *win;
+    z_stream strm;
+    struct back_buf back;
+
+    mem_setup(&strm);
+    ret = deflateInit2(&strm, Z_BEST_COMPRESSION, Z_DEFLATED, -windowBits, 8,
+                       strategy);                assert(ret == Z_OK);
+    bound = (unsigned)deflateBound(&strm, len) + 64;
+    comp = malloc(bound);                        assert(comp != NULL);
+    strm.next_in = src;
+    strm.avail_in = len;
+    strm.next_out = comp;
+    strm.avail_out = bound;
+    ret = deflate(&strm, Z_FINISH);              assert(ret == Z_STREAM_END);
+    have = bound - strm.avail_out;
+    ret = deflateEnd(&strm);                     assert(ret == Z_OK);
+
+    out = malloc(len + 258);                     assert(out != NULL);
+    memset(out, 0x5a, len + 258);
+    ret = inflateInit2(&strm, -windowBits);      assert(ret == Z_OK);
+    strm.next_in = comp;
+    strm.avail_in = have;
+    strm.next_out = out;
+    strm.avail_out = len + 258;
+    ret = inflate(&strm, Z_FINISH);              assert(ret == Z_STREAM_END);
+    assert(strm.total_out == len);
+    assert(memcmp(out, src, len) == 0);
+    ret = inflateEnd(&strm);                     assert(ret == Z_OK);
+
+    wsize = 1U << windowBits;
+    win = malloc(wsize);                         assert(win != NULL);
+    ret = inflateBackInit(&strm, windowBits, win); assert(ret == Z_OK);
+    memset(out, 0x5a, len + 258);
+    back.out = out;
+    back.got = 0;
+    back.cap = len + 258;
+    strm.next_in = comp;
+    strm.avail_in = have;
+    ret = inflateBack(&strm, pull_none, Z_NULL, push_copy, &back);
+                                                 assert(ret == Z_STREAM_END);
+    assert(back.got == len);
+    assert(memcmp(out, src, len) == 0);
+    ret = inflateBackEnd(&strm);                 assert(ret == Z_OK);
+
+    free(win);
+    free(out);
+    free(comp);
+    mem_done(&strm, what);
+    fputs(what, stderr);
+    fputc('\n', stderr);
+}
+
+/* Deflate src in nchunk successive chunks (Z_SYNC_FLUSH between, Z_FINISH at
+   the end) and inflate into equally-sized output buffers, so that later calls
+   source matches from the window.  Also inflateBack the whole stream and
+   compare. */
+local void split_inflate(unsigned char *src, unsigned *chunk, int nchunk,
+                         int windowBits, char *what)
+{
+    int ret, k;
+    unsigned have, bound, wsize, total, off;
+    unsigned char *comp, **out, *win, *all;
+    z_stream strm;
+    struct back_buf back;
+
+    total = 0;
+    for (k = 0; k < nchunk; k++)
+        total += chunk[k];
+
+    mem_setup(&strm);
+    ret = deflateInit2(&strm, Z_BEST_COMPRESSION, Z_DEFLATED, -windowBits, 8,
+                       Z_DEFAULT_STRATEGY);      assert(ret == Z_OK);
+    bound = (unsigned)deflateBound(&strm, total) + 64;
+    comp = malloc(bound);                        assert(comp != NULL);
+    strm.next_out = comp;
+    strm.avail_out = bound;
+    off = 0;
+    for (k = 0; k < nchunk; k++) {
+        strm.next_in = src + off;
+        strm.avail_in = chunk[k];
+        ret = deflate(&strm, k == nchunk - 1 ? Z_FINISH : Z_SYNC_FLUSH);
+        assert(ret == (k == nchunk - 1 ? Z_STREAM_END : Z_OK));
+        assert(strm.avail_in == 0);
+        off += chunk[k];
+    }
+    have = bound - strm.avail_out;
+    ret = deflateEnd(&strm);                     assert(ret == Z_OK);
+
+    out = malloc((unsigned)nchunk * sizeof(unsigned char *));
+                                                 assert(out != NULL);
+    ret = inflateInit2(&strm, -windowBits);      assert(ret == Z_OK);
+    strm.next_in = comp;
+    strm.avail_in = have;
+    off = 0;
+    for (k = 0; k < nchunk; k++) {
+        out[k] = malloc(chunk[k] + (k == nchunk - 1 ? 258 : 0));
+                                                     assert(out[k] != NULL);
+        strm.next_out = out[k];
+        strm.avail_out = chunk[k];
+        ret = inflate(&strm, k == nchunk - 1 ? Z_FINISH : Z_NO_FLUSH);
+        assert(ret == (k == nchunk - 1 ? Z_STREAM_END : Z_OK));
+        assert(strm.avail_out == 0);
+        assert(memcmp(out[k], src + off, chunk[k]) == 0);
+        off += chunk[k];
+    }
+    assert(strm.total_out == total);
+    ret = inflateEnd(&strm);                     assert(ret == Z_OK);
+
+    wsize = 1U << windowBits;
+    win = malloc(wsize);                         assert(win != NULL);
+    all = malloc(total);                         assert(all != NULL);
+    ret = inflateBackInit(&strm, windowBits, win); assert(ret == Z_OK);
+    back.out = all;
+    back.got = 0;
+    back.cap = total;
+    strm.next_in = comp;
+    strm.avail_in = have;
+    ret = inflateBack(&strm, pull_none, Z_NULL, push_copy, &back);
+                                                 assert(ret == Z_STREAM_END);
+    assert(back.got == total);
+    assert(memcmp(all, src, total) == 0);
+    ret = inflateBackEnd(&strm);                 assert(ret == Z_OK);
+
+    free(all);
+    free(win);
+    for (k = 0; k < nchunk; k++)
+        free(out[k]);
+    free(out);
+    free(comp);
+    mem_done(&strm, what);
+    fputs(what, stderr);
+    fputc('\n', stderr);
+}
+
+/* Golden output for ocopy, rcopy, mixed window+output, wrap, and short
+   remainder after a window prefix. */
+local void cover_fast_copies(void)
+{
+    unsigned n, first, second, dist, extra, i, len;
+    unsigned char *src;
+    char what[64];
+    unsigned dists[3];
+    unsigned chunks[3];
+
+    src = malloc(512);                           assert(src != NULL);
+    for (n = 0; n < 3; n++) {
+        len = n == 0 ? 16 : n == 1 ? 17 : 258;
+        for (i = 0; i < 64; i++)
+            src[i] = (unsigned char)(i + 1);
+        fill_repeat(src + 64, 64 + len, 1);
+        sprintf(what, "inflate_fast rcopy dist 1 len %u", len);
+        roundtrip_raw(src, 64 + 64 + len, 15, Z_RLE, what);
+    }
+    free(src);
+
+    dists[0] = 2;
+    dists[1] = 8;
+    dists[2] = 16;
+    src = malloc(2048);                          assert(src != NULL);
+    for (n = 0; n < 3; n++) {
+        dist = dists[n];
+        fill_repeat(src, 2048, dist);
+        sprintf(what, "inflate_fast ocopy dist %u", dist);
+        roundtrip_raw(src, 2048, 15, Z_DEFAULT_STRATEGY, what);
+    }
+    free(src);
+
+    /* mixed window+output (from_out): second buffer match longer than dist */
+    first = 16384;
+    second = 200;
+    dist = 100;
+    src = malloc(first + second);                assert(src != NULL);
+    {
+        unsigned long random = 1;
+        for (i = 0; i < first; i++) {
+            random = random * 1103515245 + 12345;
+            src[i] = (unsigned char)(random >> 16);
+        }
+    }
+    for (i = 0; i < second; i++)
+        src[first + i] = src[first + i - dist];
+    chunks[0] = first;
+    chunks[1] = second;
+    split_inflate(src, chunks, 2, 15, "inflate_fast mixed window output");
+    free(src);
+
+    /* wrap-around window copy with op >= 16 (windowBits 9: zlib maps 8 to 9
+       on deflate, so 9 is the smallest window that round-trips.  600 bytes
+       fills a 512-byte window so wnext != 0 on the second inflate.) */
+    first = 600;
+    second = 200;
+    dist = 200;
+    src = malloc(first + second);                assert(src != NULL);
+    {
+        unsigned long random = 1;
+        for (i = 0; i < first; i++) {
+            random = random * 1103515245 + 12345;
+            src[i] = (unsigned char)(random >> 16);
+        }
+    }
+    for (i = 0; i < second; i++)
+        src[first + i] = src[first + i - dist];
+    chunks[0] = first;
+    chunks[1] = second;
+    split_inflate(src, chunks, 2, 9, "inflate_fast wrap around window");
+    free(src);
+
+    /* wrap-around window with bulk chunk copies.  Output phases of 480 and
+       100 bytes fill the 512-byte window and wrap its write index to
+       wnext = 68.  50 fresh bytes then a 200-byte period follow: the last
+       150 bytes of the window content plus those 50.  The first inflate_fast
+       match is then 258 bytes at dist 200 from outbeg 50, so op = 150: 82
+       bytes come from before the window wrap, 68 from after it, both bulk,
+       with 108 bytes remaining from the output.  (deflate can only reference
+       distances up to 250 at windowBits 9.) */
+    first = 480 + 100;
+    second = 50 + 4 * 200;
+    src = malloc(first + second);                assert(src != NULL);
+    {
+        unsigned long random = 1;
+        for (i = 0; i < first + 50; i++) {
+            random = random * 1103515245 + 12345;
+            src[i] = (unsigned char)(random >> 16);
+        }
+    }
+    for (i = 0; i < 4 * 200; i++)
+        src[first + 50 + i] = src[first - 150 + (i % 200)];
+    chunks[0] = 480;
+    chunks[1] = 100;
+    chunks[2] = second;
+    split_inflate(src, chunks, 3, 9, "inflate_fast wrap chunk copies");
+    free(src);
+
+    /* short remainder (1 and 2) after a window prefix of 16 */
+    first = 16384;
+    src = malloc(first + 20);                    assert(src != NULL);
+    {
+        unsigned long random = 1;
+        for (i = 0; i < first; i++) {
+            random = random * 1103515245 + 12345;
+            src[i] = (unsigned char)(random >> 16);
+        }
+    }
+    dist = 16;
+    for (extra = 1; extra <= 2; extra++) {
+        second = dist + extra;
+        for (i = 0; i < second; i++)
+            src[first + i] = src[first + i - dist];
+        sprintf(what, "inflate_fast window remainder %u", extra);
+        chunks[0] = first;
+        chunks[1] = second;
+        split_inflate(src, chunks, 2, 15, what);
+    }
+    free(src);
+}
+
+/* exercise a match sourced from the saved window into a fresh output buffer.
+   half is the size of the first inflated buffer: when it is the whole window
+   (32768 for windowBits 15), wnext is 0 on the second inflate and the match
+   source is at the end of the window; when it is half the window (16384),
+   wnext is non-zero and the source is contiguous. */
+local void cover_fast_window_half(unsigned half)
+{
+    int ret;
+    unsigned n, have;
+    unsigned long random;
+    unsigned char *source, *compressed, *first, *second;
+    z_stream strm;
+
+    /* The second half is encoded using matches from the first half.  Inflate
+       the halves into separate allocations so that the second call starts
+       with matches sourced entirely from the saved window. */
+    source = malloc(2 * half);                   assert(source != NULL);
+    first = malloc(half);                        assert(first != NULL);
+    second = malloc(half);                       assert(second != NULL);
+    random = 1;
+    for (n = 0; n < half; n++) {
+        random = random * 1103515245 + 12345;
+        source[n] = (unsigned char)(random >> 16);
+    }
+    /* Fill the start of the second half with new random bytes, then tile
+       those bytes alternating with the last 200 bytes of the first half.
+       The second half is then decoded using matches that start in the saved
+       window and continue into the fresh output buffer, exercising the
+       window chunk and output bulk copies in inflate_fast(), including the
+       16-byte thresholds.  A fresh random block first keeps the first match
+       of the second half from being the pending symbol left by the first
+       half, which inflate() would decode in its slow path. */
+    for (n = 0; n < 258; n++) {
+        random = random * 1103515245 + 12345;
+        source[half + n] = (unsigned char)(random >> 16);
+    }
+    for (n = 0; n < 6 * 458; n++)
+        source[half + 258 + n] = source[half - 200 + (n % 458)];
+    for (n = 0; n < half - 258 - 6 * 458; n++)
+        source[half + 258 + 6 * 458 + n] = source[n];
+
+    memset(&strm, 0, sizeof(strm));
+    ret = deflateInit2(&strm, Z_BEST_COMPRESSION, Z_DEFLATED, -15, 8,
+                       Z_DEFAULT_STRATEGY);       assert(ret == Z_OK);
+    have = (unsigned)deflateBound(&strm, 2 * half) + 64;
+    compressed = malloc(have);                   assert(compressed != NULL);
+    strm.next_out = compressed;
+    strm.avail_out = have;
+    strm.next_in = source;
+    strm.avail_in = half;
+    ret = deflate(&strm, Z_SYNC_FLUSH);           assert(ret == Z_OK);
+    assert(strm.avail_in == 0);
+    strm.next_in = source + half;
+    strm.avail_in = half;
+    ret = deflate(&strm, Z_FINISH);               assert(ret == Z_STREAM_END);
+    have -= strm.avail_out;
+    ret = deflateEnd(&strm);                      assert(ret == Z_OK);
+
+    mem_setup(&strm);
+    ret = inflateInit2(&strm, -15);               assert(ret == Z_OK);
+    strm.next_in = compressed;
+    strm.avail_in = have;
+    strm.next_out = first;
+    strm.avail_out = half;
+    ret = inflate(&strm, Z_NO_FLUSH);             assert(ret == Z_OK);
+    assert(strm.avail_out == 0);
+    assert(memcmp(first, source, half) == 0);
+    strm.next_out = second;
+    strm.avail_out = half;
+    ret = inflate(&strm, Z_FINISH);               assert(ret == Z_STREAM_END);
+    assert(strm.avail_out == 0);
+    assert(memcmp(second, source + half, half) == 0);
+    ret = inflateEnd(&strm);                      assert(ret == Z_OK);
+    mem_done(&strm, half == 32768 ?
+                    "inflate_fast saved window full" :
+                    "inflate_fast saved window contiguous");
+
+    free(second);
+    free(first);
+    free(compressed);
+    free(source);
+}
+
+/* exercise matches sourced from the saved window into a fresh output buffer,
+   with the first half filling the window completely and with it ending part
+   way into the window */
+local void cover_fast_window(void)
+{
+    cover_fast_window_half(32768);
+    cover_fast_window_half(16384);
+}
+
+/* Hex cases cover inflate_fast() error paths and return codes only (no
+   memcmp).  cover_fast_copies() checks ocopy/rcopy/from_out/wrap/short
+   remainder bytes via inflate and inflateBack.  cover_fast_window() checks
+   non-overlapping window memcpy into a fresh output buffer. */
 local void cover_fast(void)
 {
     inf("e5 e0 81 ad 6d cb b2 2c c9 01 1e 59 63 ae 7d ee fb 4d fd b5 35 41 68"
@@ -657,6 +1052,8 @@ local void cover_fast(void)
         "contiguous and wrap around window", 6, -8, 259, Z_OK);
     inf("63 0 3 0 0 0 0 0", "copy direct from output", 0, -8, 259,
         Z_STREAM_END);
+    cover_fast_window();
+    cover_fast_copies();
 }
 
 int main(void)

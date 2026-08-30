@@ -169,6 +169,14 @@ int ZLIB_INTERNAL zmemcmp(const void FAR *s1, const void FAR *s2, z_size_t n) {
     return 0;
 }
 
+void ZLIB_INTERNAL zmemset(void FAR *b, int val, z_size_t len) {
+    uchf *p = b;
+    while (len) {
+        *p++ = (uch)val;
+        len--;
+    }
+}
+
 void ZLIB_INTERNAL zmemzero(void FAR *b, z_size_t len) {
     uchf *p = b;
     while (len) {

@@ -46,7 +46,44 @@
       bytes, which is the maximum length that can be coded.  inflate_fast()
       requires strm->avail_out >= 258 for each loop to avoid checking for
       output space.
+
+    - memcpy from the sliding window is skipped when the window is also the
+      output buffer (inflateBack(), window == beg), because memcpy of
+      overlapping regions is undefined.
  */
+
+/*
+   Copy len bytes to out from out - dist, repeating a dist-byte pattern.
+   Each memcpy is non-overlapping (length at most the bytes already written).
+   Only called for len >= 16 and dist >= 2.
+ */
+local unsigned char FAR *ocopy(unsigned char FAR *out, unsigned dist,
+                               unsigned len) {
+    unsigned n, k;
+
+    Assert(dist >= 2 && len >= 16, "ocopy");
+    n = len >= dist ? dist : len;
+    zmemcpy(out, out - dist, n);
+    out += n;
+    len -= n;
+    while (len) {
+        k = len >= n ? n : len;
+        zmemcpy(out, out - n, k);
+        out += k;
+        len -= k;
+        n += k;
+    }
+    return out;
+}
+
+/* Copy a run of the byte immediately preceding out.  Only called for
+   len >= 16. */
+local unsigned char FAR *rcopy(unsigned char FAR *out, unsigned len) {
+    Assert(len >= 16, "rcopy");
+    zmemset(out, out[-1], len);
+    return out + len;
+}
+
 void ZLIB_INTERNAL inflate_fast(z_streamp strm, unsigned start) {
     struct inflate_state FAR *state;
     z_const unsigned char FAR *in;      /* local strm->next_in */
@@ -61,6 +98,7 @@ void ZLIB_INTERNAL inflate_fast(z_streamp strm, unsigned start) {
     unsigned whave;             /* valid bytes in the window */
     unsigned wnext;             /* window write index */
     unsigned char FAR *window;  /* allocated sliding window, if wsize != 0 */
+    unsigned window_output;     /* true if window is also output buffer */
     unsigned long hold;         /* local strm->hold */
     unsigned bits;              /* local strm->bits */
     code const FAR *lcode;      /* local strm->lencode */
@@ -73,6 +111,7 @@ void ZLIB_INTERNAL inflate_fast(z_streamp strm, unsigned start) {
     unsigned len;               /* match length, unused bytes */
     unsigned dist;              /* match distance */
     unsigned char FAR *from;    /* where to copy match from */
+    unsigned from_out;          /* true if match source is output */
 
     /* copy state to local variables */
     state = (struct inflate_state FAR *)strm->state;
@@ -88,6 +127,7 @@ void ZLIB_INTERNAL inflate_fast(z_streamp strm, unsigned start) {
     whave = state->whave;
     wnext = state->wnext;
     window = state->window;
+    window_output = window != Z_NULL && window == beg;
     hold = state->hold;
     bits = state->bits;
     lcode = state->lencode;
@@ -195,14 +235,30 @@ void ZLIB_INTERNAL inflate_fast(z_streamp strm, unsigned start) {
 #endif
                     }
                     from = window;
+                    from_out = 0;
                     if (wnext == 0) {           /* very common case */
                         from += wsize - op;
                         if (op < len) {         /* some from window */
                             len -= op;
-                            do {
-                                *out++ = *from++;
-                            } while (--op);
+                            if (op >= 16 && !window_output) {
+                                zmemcpy(out, from, op);
+                                out += op;
+                            }
+                            else {
+                                while (op > 2) {
+                                    *out++ = *from++;
+                                    *out++ = *from++;
+                                    *out++ = *from++;
+                                    op -= 3;
+                                }
+                                if (op) {
+                                    *out++ = *from++;
+                                    if (op > 1)
+                                        *out++ = *from++;
+                                }
+                            }
                             from = out - dist;  /* rest from output */
+                            from_out = 1;
                         }
                     }
                     else if (wnext < op) {      /* wrap around window */
@@ -210,17 +266,46 @@ void ZLIB_INTERNAL inflate_fast(z_streamp strm, unsigned start) {
                         op -= wnext;
                         if (op < len) {         /* some from end of window */
                             len -= op;
-                            do {
-                                *out++ = *from++;
-                            } while (--op);
+                            if (op >= 16 && !window_output) {
+                                zmemcpy(out, from, op);
+                                out += op;
+                            }
+                            else {
+                                while (op > 2) {
+                                    *out++ = *from++;
+                                    *out++ = *from++;
+                                    *out++ = *from++;
+                                    op -= 3;
+                                }
+                                if (op) {
+                                    *out++ = *from++;
+                                    if (op > 1)
+                                        *out++ = *from++;
+                                }
+                            }
                             from = window;
                             if (wnext < len) {  /* some from start of window */
                                 op = wnext;
                                 len -= op;
-                                do {
-                                    *out++ = *from++;
-                                } while (--op);
+                                if (op >= 16 && !window_output) {
+                                    zmemcpy(out, from, op);
+                                    out += op;
+                                }
+                                else {
+                                    while (op > 2) {
+                                        *out++ = *from++;
+                                        *out++ = *from++;
+                                        *out++ = *from++;
+                                        op -= 3;
+                                    }
+                                    if (op) {
+                                        *out++ = *from++;
+                                        if (op > 1)
+                                            *out++ = *from++;
+                                    }
+                                }
                                 from = out - dist;      /* rest from output */
+                                from_out = 1;
                             }
                         }
                     }
@@ -228,36 +313,91 @@ void ZLIB_INTERNAL inflate_fast(z_streamp strm, unsigned start) {
                         from += wnext - op;
                         if (op < len) {         /* some from window */
                             len -= op;
-                            do {
-                                *out++ = *from++;
-                            } while (--op);
+                            if (op >= 16 && !window_output) {
+                                zmemcpy(out, from, op);
+                                out += op;
+                            }
+                            else {
+                                while (op > 2) {
+                                    *out++ = *from++;
+                                    *out++ = *from++;
+                                    *out++ = *from++;
+                                    op -= 3;
+                                }
+                                if (op) {
+                                    *out++ = *from++;
+                                    if (op > 1)
+                                        *out++ = *from++;
+                                }
+                            }
                             from = out - dist;  /* rest from output */
+                            from_out = 1;
                         }
                     }
-                    while (len > 2) {
-                        *out++ = *from++;
-                        *out++ = *from++;
-                        *out++ = *from++;
-                        len -= 3;
-                    }
                     if (len) {
-                        *out++ = *from++;
-                        if (len > 1)
-                            *out++ = *from++;
+                        if (from_out) {         /* copy direct from output */
+                            from = out - dist;
+                            if (len >= 16) {
+                                if (dist == 1)
+                                    out = rcopy(out, len);
+                                else
+                                    out = ocopy(out, dist, len);
+                            }
+                            else {
+                                while (len > 2) {
+                                    *out++ = *from++;
+                                    *out++ = *from++;
+                                    *out++ = *from++;
+                                    len -= 3;
+                                }
+                                if (len) {
+                                    *out++ = *from++;
+                                    if (len > 1)
+                                        *out++ = *from++;
+                                }
+                            }
+                        }
+                        else {                  /* all from window */
+                            if (len >= 16 && !window_output) {
+                                zmemcpy(out, from, len);
+                                out += len;
+                            }
+                            else {
+                                while (len > 2) {
+                                    *out++ = *from++;
+                                    *out++ = *from++;
+                                    *out++ = *from++;
+                                    len -= 3;
+                                }
+                                if (len) {
+                                    *out++ = *from++;
+                                    if (len > 1)
+                                        *out++ = *from++;
+                                }
+                            }
+                        }
                     }
                 }
                 else {
                     from = out - dist;          /* copy direct from output */
-                    do {                        /* minimum length is three */
-                        *out++ = *from++;
-                        *out++ = *from++;
-                        *out++ = *from++;
-                        len -= 3;
-                    } while (len > 2);
-                    if (len) {
-                        *out++ = *from++;
-                        if (len > 1)
+                    if (len >= 16) {
+                        if (dist == 1)          /* run of a repeated byte */
+                            out = rcopy(out, len);
+                        else
+                            out = ocopy(out, dist, len);
+                    }
+                    else {                      /* minimum length is three */
+                        do {
                             *out++ = *from++;
+                            *out++ = *from++;
+                            *out++ = *from++;
+                            len -= 3;
+                        } while (len > 2);
+                        if (len) {
+                            *out++ = *from++;
+                            if (len > 1)
+                                *out++ = *from++;
+                        }
                     }
                 }
             }
@@ -316,6 +456,9 @@ void ZLIB_INTERNAL inflate_fast(z_streamp strm, unsigned start) {
    - Swapping window/direct else
    - Larger unrolled copy loops (three is about right)
    - Moving len -= 3 statement into middle of loop
+
+   The overlapped load/store copy above is not the same as the current
+   non-overlapping chunked memcpy / memset match copies.
  */
 
 #endif /* !ASMINF */
