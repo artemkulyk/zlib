@@ -211,15 +211,18 @@ extern z_const char * const z_errmsg[10]; /* indexed by 2-zlib_error */
 #  ifdef SMALL_MEDIUM /* MSDOS small or medium model */
 #    define zmemcpy _fmemcpy
 #    define zmemcmp _fmemcmp
+#    define zmemset(dest, val, len) _fmemset(dest, val, len)
 #    define zmemzero(dest, len) _fmemset(dest, 0, len)
 #  else
 #    define zmemcpy memcpy
 #    define zmemcmp memcmp
+#    define zmemset(dest, val, len) memset(dest, val, len)
 #    define zmemzero(dest, len) memset(dest, 0, len)
 #  endif
 #else
    void ZLIB_INTERNAL zmemcpy(void FAR *, const void FAR *, z_size_t);
    int ZLIB_INTERNAL zmemcmp(const void FAR *, const void FAR *, z_size_t);
+   void ZLIB_INTERNAL zmemset(void FAR *, int, z_size_t);
    void ZLIB_INTERNAL zmemzero(void FAR *, z_size_t);
 #endif
 
