@@ -84,7 +84,7 @@ jobs:
             name: Windows ARM64 MSYS2 clangarm64
             os: windows-11-arm
             shell: msys2 {0}
-            cc: gcc
+            cc: clang
             cflags: -O3
             msystem: clangarm64
 
@@ -104,6 +104,7 @@ jobs:
           make
           git
           python
+          diffutils
         pacboy: >-
           toolchain:p
 
@@ -149,9 +150,14 @@ jobs:
           mkdir -p "$WORKDIR/$1"
           git archive "$2" | tar -x -C "$WORKDIR/$1"
           # static builds minigzip$(EXE); a bare minigzip goal misses .exe on Windows
-          ( cd "$WORKDIR/$1" && ./configure --static > configure.log 2>&1 &&
-            make -j"$j" static )
+          if ! ( cd "$WORKDIR/$1" && ./configure --static > configure.log 2>&1 &&
+            make -j"$j" static ); then
+            echo "configure/make failed in $1"
+            cat "$WORKDIR/$1/configure.log"
+            exit 1
+          fi
         done
+        command -v cmp >/dev/null
         if cmp -s "$WORKDIR/stock/inffast.o" "$WORKDIR/opt/inffast.o"; then
           echo "::error::inffast.o is identical to the baseline"
           exit 1
