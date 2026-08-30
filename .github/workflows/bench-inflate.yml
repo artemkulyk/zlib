@@ -1,0 +1,130 @@
+name: Bench inflate
+
+# Builds the current tree and a baseline ref with identical flags, checks that
+# both produce the same bytes, then compares inflate throughput on real
+# hardware for several ISAs.  Reports only; never fails on a speed change.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Baseline git ref to compare against
+        default: origin/develop
+      rounds:
+        description: Interleaved stock/opt rounds per case
+        default: '3'
+      iters:
+        description: Timed inflates per round
+        default: '25'
+  pull_request:
+
+jobs:
+  bench:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: linux-x86-64
+            name: Linux x86-64 glibc
+            os: ubuntu-24.04
+            cflags: -O3
+
+          - id: linux-aarch64
+            name: Linux aarch64 glibc
+            os: ubuntu-24.04-arm
+            cflags: -O3
+
+          - id: linux-x86-32
+            name: Linux x86 32-bit
+            os: ubuntu-24.04
+            cflags: -O3 -m32
+            packages: gcc-multilib
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+
+    - name: Install packages
+      if: matrix.packages
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.packages }}
+
+    - name: Resolve baseline
+      id: base
+      run: |
+        if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+          base='${{ github.event.pull_request.base.sha }}'
+        else
+          base='${{ inputs.base_ref }}'
+        fi
+        echo "sha=$(git rev-parse "$base")" >> "$GITHUB_OUTPUT"
+        git log -1 --oneline "$base"
+
+    - name: Build baseline and current
+      env:
+        CFLAGS: ${{ matrix.cflags }}
+      run: |
+        set -eu
+        for pair in "stock ${{ steps.base.outputs.sha }}" "opt HEAD"; do
+          set -- $pair
+          mkdir -p "/tmp/$1"
+          git archive "$2" | tar -x -C "/tmp/$1"
+          ( cd "/tmp/$1" && ./configure --static > configure.log 2>&1 &&
+            make -j"$(nproc)" libz.a minigzip )
+        done
+        # If the object is unchanged there is nothing to measure.
+        if cmp -s /tmp/stock/inffast.o /tmp/opt/inffast.o; then
+          echo "::error::inffast.o is identical to the baseline"
+          exit 1
+        fi
+
+    - name: Generate corpora
+      run: python3 .github/bench/make_corpora.py --out /tmp/corpora
+
+    - name: Check both builds decompress identically
+      run: |
+        set -eu
+        for bin in /tmp/corpora/*.bin; do
+          name=$(basename "$bin" .bin)
+          for tree in stock opt; do
+            "/tmp/$tree/minigzip" -d -c < "/tmp/corpora/$name.gz" > "/tmp/$tree.out"
+            cmp "$bin" "/tmp/$tree.out"
+          done
+        done
+        echo "all corpora decompress byte-identically on both builds"
+
+    - name: Build benchmark
+      env:
+        CFLAGS: ${{ matrix.cflags }}
+      run: |
+        set -eu
+        for tree in stock opt; do
+          cc $CFLAGS -Wall -Wextra -I "/tmp/$tree" \
+            -o "/tmp/bench-$tree" .github/bench/inflate_bench.c \
+            "/tmp/$tree/libz.a"
+        done
+
+    - name: Run benchmark
+      run: |
+        python3 .github/bench/run_bench.py \
+          --stock /tmp/bench-stock \
+          --opt /tmp/bench-opt \
+          --data /tmp/corpora \
+          --csv /tmp/bench.csv \
+          --label "${{ matrix.name }}" \
+          --rounds "${{ inputs.rounds || '3' }}" \
+          --iters "${{ inputs.iters || '25' }}" \
+          --clock cpu
+
+    - name: Upload results
+      uses: actions/upload-artifact@v6
+      if: always()
+      with:
+        name: bench-${{ matrix.id }}
+        path: /tmp/bench.csv
+        retention-days: 14
